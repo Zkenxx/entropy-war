@@ -94,9 +94,26 @@ class Particle {
     }
 }
 
+// ==========================================
+// 修复点：残骸价值计算 (Economy Fix)
+// ==========================================
 class Wreckage {
   x: number; y: number; value: number; radius: number = 8; marked: boolean = false; mass: number = 20;
-  constructor(x: number, y: number, cost: number) { this.x=x; this.y=y; this.value = cost * CONFIG.WRECKAGE_VALUE; }
+  
+  constructor(x: number, y: number, unitType: UnitType) { 
+    this.x = x; this.y = y; 
+    
+    // 1. 获取该兵种的总造价 (例如盾卫 $100)
+    const totalCost = UNIT_STATS[unitType].cost;
+    // 2. 获取该兵种一次造几个 (例如盾卫 x3)
+    const squadCount = UNIT_STATS[unitType].count;
+    // 3. 计算单体造价 (100 / 3 = 33.3)
+    const unitCost = totalCost / squadCount;
+    
+    // 4. 应用回收率 (70%)
+    // 盾卫死一个掉落: 33.3 * 0.7 = 23块
+    this.value = unitCost * CONFIG.WRECKAGE_VALUE; 
+  }
   draw(ctx: CanvasRenderingContext2D) {
     // 视觉优化：闪烁的残骸
     const flash = Math.abs(Math.sin(Date.now()/300));
