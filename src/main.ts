@@ -1,80 +1,111 @@
 /**
- * 《熵减战争》 (Entropy Reduction War) - MOBA Map Layout
- * 核心升级：仿生眼型地图分布、非线性兵线、动态支援难度
+ * 《熵减战争》 (Entropy Reduction War) - Tactical Balance Patch
+ * 核心调整：经济紧缩、节奏降速、AI波次集结、塔积缩小
  */
 
+// ==========================================
+// 1. 核心数值配置 (Balance Config)
+// ==========================================
 const CONFIG = {
   WIDTH: 1200,
   HEIGHT: 800,
   FPS: 60,
-  BLOCKADE_THRESHOLD: 3000,
-  // 核心参数
-  LANE_CURVE: 280,        // 边路最大弯曲程度 (决定中场的宽度)
-  LINK_MAX_DIST: 200,     // 网状连接的最大物理距离 (超过这个距离连不上)
-  DECAY_RATE: 0.7,        // 距离衰减 (边路因为路长，衰减更狠)
-  WRECKAGE_MASS: 25,
+  
+  // 经济系统：紧缩
+  STARTING_RES: 250,      // 初始资源大幅减少 (原800)
+  PASSIVE_INCOME: 0.1,    // 自然增长极慢 (原0.5)，强迫玩家回收残骸
+  WRECKAGE_VALUE: 0.7,    // 残骸回收率高，鼓励进攻
+
+  // 节奏控制
+  GAME_SPEED_MOD: 0.8,    // 全局速度修正
+  DECAY_RATE: 0.6,        // 远征衰减
+  
+  // 胜利条件
+  BLOCKADE_THRESHOLD: 4000, // 需要更长时间的压制才能赢
 };
 
 enum UnitType { SHIELD='🛡️', CROSSBOW='🏹', CAVALRY='🐎', TOWER='🏯' }
 enum Faction { PLAYER=1, ENEMY=-1 }
 enum Lane { TOP=0, MID=1, BOT=2 }
 
+// 单位数值重构：高血量，低速度，强调职能
 const UNIT_STATS = {
-  [UnitType.SHIELD]:   { hp: 500, dmg: 8,  range: 40,  speed: 0.6, radius: 18, cost: 100, count: 3, mass: 30, color:'#3498db' },
-  [UnitType.CROSSBOW]: { hp: 120, dmg: 45, range: 200, speed: 0.9, radius: 12, cost: 150, count: 4, mass: 5,  color:'#2ecc71' },
-  [UnitType.CAVALRY]:  { hp: 350, dmg: 25, range: 35,  speed: 3.0, radius: 16, cost: 200, count: 2, mass: 18, color:'#e74c3c' },
-  [UnitType.TOWER]:    { hp: 5000, dmg: 90, range: 280, speed: 0,   radius: 40, cost: 0,   count: 1, mass: 9999,color:'#f1c40f' }
+  [UnitType.SHIELD]:   { 
+      hp: 600, dmg: 12, range: 45, speed: 0.5, radius: 16, // 慢速坦克
+      cost: 100, count: 3, mass: 40, color:'#3498db', label: '重装盾卫' 
+  },
+  [UnitType.CROSSBOW]: { 
+      hp: 120, dmg: 35, range: 180, speed: 0.8, radius: 10, // 脆皮输出，射程削弱以防风筝
+      cost: 140, count: 3, mass: 5,  color:'#2ecc71', label: '狙击弩手' 
+  },
+  [UnitType.CAVALRY]:  { 
+      hp: 350, dmg: 20, range: 35, speed: 1.8, radius: 14, // 突进破阵
+      cost: 220, count: 2, mass: 25, color:'#e74c3c', label: '重骑兵' 
+  },
+  [UnitType.TOWER]:    { 
+      hp: 4000, dmg: 50, range: 220, speed: 0, radius: 25, // 塔缩小(40->25)，伤害降低
+      cost: 0, count: 1, mass: 9999, color:'#f1c40f', label: '' 
+  }
 };
 
 const DAMAGE_MATRIX = {
-  [UnitType.SHIELD]:   { [UnitType.SHIELD]: 1.0, [UnitType.CROSSBOW]: 1.5, [UnitType.CAVALRY]: 0.5, [UnitType.TOWER]: 0.2 },
-  [UnitType.CROSSBOW]: { [UnitType.SHIELD]: 0.5, [UnitType.CROSSBOW]: 1.0, [UnitType.CAVALRY]: 2.0, [UnitType.TOWER]: 1.0 },
-  [UnitType.CAVALRY]:  { [UnitType.SHIELD]: 2.0, [UnitType.CROSSBOW]: 1.0, [UnitType.CAVALRY]: 1.0, [UnitType.TOWER]: 0.4 },
-  [UnitType.TOWER]:    { [UnitType.SHIELD]: 1.0, [UnitType.CROSSBOW]: 1.5, [UnitType.CAVALRY]: 1.0, [UnitType.TOWER]: 0 }
+  [UnitType.SHIELD]:   { [UnitType.SHIELD]: 1.0, [UnitType.CROSSBOW]: 1.5, [UnitType.CAVALRY]: 0.5, [UnitType.TOWER]: 0.4 },
+  [UnitType.CROSSBOW]: { [UnitType.SHIELD]: 0.5, [UnitType.CROSSBOW]: 1.0, [UnitType.CAVALRY]: 2.0, [UnitType.TOWER]: 0.8 },
+  [UnitType.CAVALRY]:  { [UnitType.SHIELD]: 2.0, [UnitType.CROSSBOW]: 1.0, [UnitType.CAVALRY]: 1.0, [UnitType.TOWER]: 0.5 },
+  [UnitType.TOWER]:    { [UnitType.SHIELD]: 1.0, [UnitType.CROSSBOW]: 1.2, [UnitType.CAVALRY]: 1.0, [UnitType.TOWER]: 0 }
 };
 
 // ==========================================
-// 1. 地图几何学 (Map Geometry)
+// 2. 地图几何 (Eye-Shape Map)
 // ==========================================
-class MapGeometry {
-  // 获取某条路在特定X坐标的理想Y坐标
+class MapUtils {
   static getLaneY(lane: Lane, x: number): number {
-    const centerY = CONFIG.HEIGHT / 2;
-    if (lane === Lane.MID) return centerY;
-
-    // 归一化进度 (0~1)
-    const progress = x / CONFIG.WIDTH;
-    // 正弦波曲线：两头(0,1)为0，中间(0.5)最大
-    const curve = Math.sin(progress * Math.PI) * CONFIG.LANE_CURVE;
-    
-    return lane === Lane.TOP ? centerY - curve : centerY + curve;
+    const cy = CONFIG.HEIGHT / 2;
+    if (lane === Lane.MID) return cy;
+    // 稍微减小弯曲度，让战场更紧凑
+    const curve = Math.sin((x / CONFIG.WIDTH) * Math.PI) * 220;
+    return lane === Lane.TOP ? cy - curve : cy + curve;
   }
-
-  // 获取某位置的切线方向 (用于移动)
-  static getLaneVector(lane: Lane, x: number, faction: Faction): {vx: number, vy: number} {
-    const dir = faction === Faction.PLAYER ? 1 : -1;
-    if (lane === Lane.MID) return { vx: dir, vy: 0 };
-
-    const step = 10 * dir;
-    const currY = this.getLaneY(lane, x);
-    const nextY = this.getLaneY(lane, x + step);
-    
-    const dx = step;
-    const dy = nextY - currY;
-    const len = Math.hypot(dx, dy);
-    return { vx: dx/len, vy: dy/len };
+  
+  static getLaneTangent(lane: Lane, x: number, dir: number) {
+      if (lane === Lane.MID) return {x: dir, y: 0};
+      const y1 = MapUtils.getLaneY(lane, x);
+      const y2 = MapUtils.getLaneY(lane, x + 10*dir);
+      const angle = Math.atan2(y2-y1, 10*dir);
+      return {x: Math.cos(angle), y: Math.sin(angle)};
   }
 }
 
 // ==========================================
-// 2. 实体系统
+// 3. 游戏实体 (Entities)
 // ==========================================
+
+class Particle {
+    x: number; y: number; vx: number; vy: number; life: number; color: string;
+    constructor(x:number, y:number, c:string) {
+        this.x=x; this.y=y; this.color=c; this.life=1.0;
+        const a = Math.random()*Math.PI*2; const s = Math.random()*2;
+        this.vx=Math.cos(a)*s; this.vy=Math.sin(a)*s;
+    }
+    update() { this.x+=this.vx; this.y+=this.vy; this.life-=0.05; }
+    draw(ctx:CanvasRenderingContext2D) {
+        ctx.globalAlpha=this.life; ctx.fillStyle=this.color; 
+        ctx.beginPath(); ctx.arc(this.x,this.y,2,0,Math.PI*2); ctx.fill(); ctx.globalAlpha=1;
+    }
+}
+
 class Wreckage {
-  x: number; y: number; value: number; radius: number = 10; marked: boolean = false; mass: number = CONFIG.WRECKAGE_MASS;
-  constructor(x: number, y: number, cost: number) { this.x=x; this.y=y; this.value = cost*0.6; }
+  x: number; y: number; value: number; radius: number = 8; marked: boolean = false; mass: number = 20;
+  constructor(x: number, y: number, cost: number) { this.x=x; this.y=y; this.value = cost * CONFIG.WRECKAGE_VALUE; }
   draw(ctx: CanvasRenderingContext2D) {
-    ctx.fillStyle='#444'; ctx.beginPath(); ctx.arc(this.x,this.y,this.radius,0,Math.PI*2); ctx.fill();
-    ctx.strokeStyle='#666'; ctx.stroke(); ctx.fillStyle='#0ff'; ctx.font='10px Arial'; ctx.fillText('+',this.x-3,this.y+3);
+    // 视觉优化：闪烁的残骸
+    const flash = Math.abs(Math.sin(Date.now()/300));
+    ctx.fillStyle = `rgba(100,100,100,${0.5+flash*0.3})`;
+    ctx.beginPath(); ctx.arc(this.x, this.y, this.radius, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth=1; ctx.stroke();
+    // 显示价值
+    ctx.fillStyle = '#0ff'; ctx.font='10px monospace'; ctx.textAlign='center';
+    ctx.fillText(`+${Math.floor(this.value)}`, this.x, this.y-10);
   }
 }
 
@@ -85,56 +116,33 @@ class Unit {
   vx: number = 0; vy: number = 0;
   radius: number; mass: number; 
   cooldown: number = 0; dead: boolean = false; static: boolean = false;
-  inNetwork: boolean = false;
+  
+  hitFlash: number = 0; // 受击反馈
 
   constructor(id: number, type: UnitType, faction: Faction, lane: Lane, x: number) {
     this.id = id; this.type = type; this.faction = faction; this.lane = lane;
-    this.x = x; this.y = MapGeometry.getLaneY(lane, x);
+    this.x = x; this.y = MapUtils.getLaneY(lane, x) + (Math.random()-0.5)*20; // 稍微分散
     
     const s = UNIT_STATS[type];
     this.maxHp = s.hp; this.hp = s.hp; this.radius = s.radius; this.mass = s.mass;
     this.static = (s.speed === 0);
   }
 
-  update(dt: number, units: Unit[], wrecks: Wreckage[], zones: any[]) {
-    if (this.dead) return;
+  update(units: Unit[], wrecks: Wreckage[]) {
+    if(this.dead) return;
+    if(this.hitFlash>0) this.hitFlash--;
 
-    // 1. 网络判定
-    this.inNetwork = false;
+    // 1. 距离衰减 (Entropy)
+    let entropy = 1.0;
     if (!this.static) {
-        for(const z of zones) {
-            if(z.faction === this.faction) {
-                // 简单的点圆判定是否在连接范围内
-                // 实际上是判断是否在两个塔的连线附近
-                // 这里简化判定：如果单位在塔的有效Link范围内
-            }
-        }
-        // 更简单的逻辑：只要存活的相邻塔连线存在，且自己在X区间内
-        // 在 Game.update 中计算了 zones，这里直接用
-        for(const z of zones) {
-            if(z.faction === this.faction && this.x >= Math.min(z.x1,z.x2) && this.x <= Math.max(z.x1,z.x2)) {
-                 // Y轴判定：在两条曲线之间
-                 const minY = Math.min(z.y1, z.y2);
-                 const maxY = Math.max(z.y1, z.y2);
-                 if (this.y > minY - 50 && this.y < maxY + 50) this.inNetwork = true;
-            }
-        }
+        const dist = this.faction===Faction.PLAYER ? this.x : (CONFIG.WIDTH-this.x);
+        entropy = Math.max(0.4, 1 - (dist/CONFIG.WIDTH)*CONFIG.DECAY_RATE);
     }
-
-    // 2. 属性修正 (MOBA逻辑：中路短但危险，边路长且衰减)
-    // 计算路程进度而不是绝对X距离
-    const progress = this.faction===Faction.PLAYER ? this.x/CONFIG.WIDTH : (CONFIG.WIDTH-this.x)/CONFIG.WIDTH;
-    // 边路惩罚：如果是边路，衰减系数更大 (因为路更难走)
-    const lanePenalty = this.lane === Lane.MID ? 1.0 : 0.8; 
-    const entropy = Math.max(0.3, (1 - progress * CONFIG.DECAY_RATE) * lanePenalty);
-    
-    const buffSpd = this.inNetwork ? 1.5 : 1.0;
     this.dmg = UNIT_STATS[this.type].dmg * entropy;
 
-    // 3. 索敌与移动
+    // 2. 索敌 (Targeting)
     let target = null; let minDist = Infinity;
-    const range = UNIT_STATS[this.type].range * (this.inNetwork?1.2:1.0);
-
+    const range = UNIT_STATS[this.type].range;
     for(const u of units) {
         if(u.faction !== this.faction && !u.dead) {
             const d = Math.hypot(u.x-this.x, u.y-this.y);
@@ -142,34 +150,41 @@ class Unit {
         }
     }
 
+    // 3. 状态机
     if(target && minDist <= range + target.radius) {
+        // 攻击
         if(this.cooldown<=0) {
-            target.takeDamage(this.dmg * DAMAGE_MATRIX[this.type][target.type]);
-            this.cooldown = 60;
-            if(this.type===UnitType.CAVALRY && !target.static) {
-                const a = Math.atan2(target.y-this.y, target.x-this.x);
-                target.vx += Math.cos(a)*8; target.vy += Math.sin(a)*8;
-            }
-        } else this.cooldown--;
-        if(!this.static) { this.vx*=0.8; this.vy*=0.8; }
-    } else {
-        if(!this.static) {
-            const baseSpd = UNIT_STATS[this.type].speed * buffSpd;
-            // 核心移动逻辑：沿着兵线切线走
-            const vec = MapGeometry.getLaneVector(this.lane, this.x, this.faction);
+            const mult = DAMAGE_MATRIX[this.type][target.type];
+            target.takeDamage(this.dmg * mult);
+            this.cooldown = 60; // 1秒攻击一次 (慢节奏)
             
-            this.vx += vec.vx * baseSpd * 0.1;
-            this.vy += vec.vy * baseSpd * 0.1;
+            // 攻击特效
+            Game.inst.fx.push({x1:this.x, y1:this.y, x2:target.x, y2:target.y, life:5, color: this.faction===Faction.PLAYER?'#0ff':'#f05'});
+        } else this.cooldown--;
+        
+        // 攻击时大幅减速
+        if(!this.static) { this.vx *= 0.1; this.vy *= 0.1; }
 
-            // 强力归队力 (Magnetic Lane)
-            const idealY = MapGeometry.getLaneY(this.lane, this.x);
-            // 如果在网络内，允许更自由的移动(Y轴阻力小)，否则锁死在兵线
-            const yStiffness = this.inNetwork ? 0.02 : 0.15;
-            this.vy += (idealY - this.y) * yStiffness;
+    } else {
+        // 移动 (Movement)
+        if(!this.static) {
+            const baseSpd = UNIT_STATS[this.type].speed * CONFIG.GAME_SPEED_MOD;
+            const dir = this.faction === Faction.PLAYER ? 1 : -1;
+            
+            // 沿兵线切线移动
+            const tan = MapUtils.getLaneTangent(this.lane, this.x, dir);
+            
+            // 基础推进力
+            this.vx += tan.x * baseSpd * 0.1;
+            this.vy += tan.y * baseSpd * 0.1;
 
-            // 速度限制
+            // 强力归队 (防止飞出地图)
+            const idealY = MapUtils.getLaneY(this.lane, this.x);
+            this.vy += (idealY - this.y) * 0.05;
+
+            // 速度钳制
             const s = Math.hypot(this.vx, this.vy);
-            if(s>baseSpd) { this.vx=(this.vx/s)*baseSpd; this.vy=(this.vy/s)*baseSpd; }
+            if(s > baseSpd) { this.vx=(this.vx/s)*baseSpd; this.vy=(this.vy/s)*baseSpd; }
             
             this.x += this.vx; this.y += this.vy;
         }
@@ -180,262 +195,326 @@ class Unit {
         for(const w of wrecks) {
             if(!w.marked && Math.hypot(w.x-this.x, w.y-this.y) < this.radius+w.radius) {
                 Game.inst.addRes(this.faction, w.value); w.marked=true;
+                // 回收特效文字
+                Game.inst.texts.push({x:this.x, y:this.y-20, txt:`+$${Math.floor(w.value)}`, life:40, color:'#0ff'});
             }
         }
     }
   }
 
   takeDamage(n: number) {
-      this.hp -= n;
+      this.hp -= n; 
+      this.hitFlash = 5;
       if(this.hp<=0) {
-          this.dead=true;
-          if(!this.static) Game.inst.spawnWreck(this.x, this.y, UNIT_STATS[this.type].cost);
-          if(this.type===UnitType.TOWER) Game.inst.shake=30;
+          this.dead = true;
+          // 死亡生成残骸
+          if(!this.static) Game.inst.wrecks.push(new Wreckage(this.x, this.y, UNIT_STATS[this.type].cost));
+          // 死亡粒子
+          for(let i=0; i<5; i++) Game.inst.particles.push(new Particle(this.x, this.y, UNIT_STATS[this.type].color));
+          if(this.type === UnitType.TOWER) Game.inst.shake = 15;
       }
   }
 
   draw(ctx: CanvasRenderingContext2D) {
       ctx.save(); ctx.translate(this.x, this.y);
-      const scale = this.static ? 1 : 0.6 + 0.4*(this.dmg/UNIT_STATS[this.type].dmg);
-      ctx.scale(scale, scale);
       
-      const c = this.faction===Faction.PLAYER ? UNIT_STATS[this.type].color : (this.type===UnitType.TOWER?'#c0392b':'#7f8c8d');
-      ctx.fillStyle=c; ctx.strokeStyle=c; ctx.lineWidth=2;
-      
-      if(this.inNetwork) { ctx.shadowBlur=15; ctx.shadowColor='#ff0'; }
+      const isPlayer = this.faction === Faction.PLAYER;
+      let color = UNIT_STATS[this.type].color;
+      if(!isPlayer) color = this.type===UnitType.TOWER ? '#c0392b' : '#aaa'; // 敌人单位去色，强调塔
+      if(this.hitFlash>0) color = '#fff';
 
-      ctx.beginPath();
-      if(this.type===UnitType.SHIELD) ctx.fillRect(-this.radius,-this.radius,this.radius*2,this.radius*2);
-      else if(this.type===UnitType.TOWER) { 
-          ctx.moveTo(0,-this.radius); ctx.lineTo(this.radius,this.radius); ctx.lineTo(-this.radius,this.radius); 
-          ctx.fill();
-          // 塔防范围圈
-          ctx.strokeStyle='rgba(255,255,255,0.1)'; ctx.beginPath(); ctx.arc(0,0,200,0,Math.PI*2); ctx.stroke();
-      }
-      else ctx.arc(0,0,this.radius,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle = color; ctx.strokeStyle = color;
       
-      if(this.faction===Faction.ENEMY) ctx.stroke();
+      // 绘制逻辑
+      if(this.type === UnitType.TOWER) {
+          ctx.beginPath(); 
+          // 塔变成六边形
+          for(let i=0; i<6; i++) {
+              const a = i*Math.PI/3;
+              ctx.lineTo(Math.cos(a)*this.radius, Math.sin(a)*this.radius);
+          }
+          ctx.fill();
+          // 血条
+          ctx.fillStyle='#333'; ctx.fillRect(-15,-35,30,5);
+          ctx.fillStyle='#0f0'; ctx.fillRect(-15,-35,30*(this.hp/this.maxHp),5);
+      } else {
+          // 单位
+          ctx.beginPath();
+          if(this.type===UnitType.SHIELD) ctx.fillRect(-this.radius,-this.radius,this.radius*2,this.radius*2);
+          else if(this.type===UnitType.CROSSBOW) { ctx.moveTo(this.radius,0); ctx.lineTo(-this.radius,-this.radius); ctx.lineTo(-this.radius,this.radius); ctx.fill(); }
+          else ctx.arc(0,0,this.radius,0,Math.PI*2); ctx.fill();
+          
+          if(!isPlayer) { ctx.lineWidth=2; ctx.stroke(); }
+      }
       ctx.restore();
   }
 }
 
 // ==========================================
-// 3. 物理引擎
+// 4. 物理与AI (Physics & AI)
 // ==========================================
 class Physics {
-    static update(units: Unit[], wrecks: Wreckage[]) {
-        // 漏斗地形约束：现在是基于曲线的漏斗
-        units.forEach(u => {
-            if(u.static) return;
-            const idealY = MapGeometry.getLaneY(u.lane, u.x);
-            // 中场(x=600)最宽，基地最窄
-            const centerDist = Math.abs(u.x - CONFIG.WIDTH/2);
-            const widthFactor = 1 - (centerDist / (CONFIG.WIDTH/2)); // 0~1
-            const spread = 20 + 40 * widthFactor; // 基地附近窄，中间宽
-            
-            if(u.y > idealY + spread) u.y = idealY + spread;
-            if(u.y < idealY - spread) u.y = idealY - spread;
-        });
-
-        // 碰撞
+    static resolve(units: Unit[], wrecks: Wreckage[]) {
         for(let i=0; i<units.length; i++) {
             for(let j=i+1; j<units.length; j++) {
                 const u1=units[i]; const u2=units[j];
                 if(u1.dead || u2.dead) continue;
-                if(u1.faction===u2.faction && (u1.static || u2.static)) continue; // 友军塔穿透
+                // 友军穿透塔 (Ghosting)
+                if(u1.faction === u2.faction && (u1.static || u2.static)) continue;
                 if(u1.static && u2.static) continue;
 
                 const d = Math.hypot(u1.x-u2.x, u1.y-u2.y);
-                const min = u1.radius+u2.radius;
+                const min = u1.radius + u2.radius;
+                
                 if(d < min) {
-                    const push = (min-d)/2;
+                    const pen = (min-d)/2;
                     const nx = (u2.x-u1.x)/d; const ny = (u2.y-u1.y)/d;
                     const tm = u1.mass+u2.mass;
-                    if(!u1.static) { u1.x-=nx*push*(u2.mass/tm); u1.y-=ny*push*(u2.mass/tm); }
-                    if(!u2.static) { u2.x+=nx*push*(u1.mass/tm); u2.y+=ny*push*(u1.mass/tm); }
+                    
+                    if(!u1.static) { u1.x-=nx*pen*(u2.mass/tm); u1.y-=ny*pen*(u2.mass/tm); }
+                    if(!u2.static) { u2.x+=nx*pen*(u1.mass/tm); u2.y+=ny*pen*(u1.mass/tm); }
                 }
             }
         }
-        // 残骸阻挡
+        // 残骸是刚体障碍
         units.forEach(u => {
             if(u.static) return;
-            for(const w of wrecks) {
-                if(w.marked) continue;
+            wrecks.forEach(w => {
+                if(w.marked) return;
                 const d = Math.hypot(u.x-w.x, u.y-w.y);
                 const min = u.radius+w.radius;
-                if(d < min) {
-                    const push = min-d;
-                    const nx = (u.x-w.x)/d; const ny = (u.y-w.y)/d;
-                    const massRatio = w.mass / (u.mass+w.mass);
-                    u.x += nx*push*massRatio; u.y += ny*push*massRatio;
+                if(d<min) {
+                    const pen=min-d;
+                    const nx=(u.x-w.x)/d; const ny=(u.y-w.y)/d;
+                    // 残骸质量20，骑兵(25)推得动，弩手(5)推不动
+                    const ratio = w.mass / (u.mass+w.mass);
+                    u.x+=nx*pen*ratio; u.y+=ny*pen*ratio;
                 }
-            }
+            });
         });
     }
 }
 
+class EnemyAI {
+    static cooldown = 0;
+    static difficultyLevel = 1; // 随时间增加
+
+    static update(game: Game) {
+        this.cooldown++;
+        // 动态难度：时间越久，AI回复越快
+        if (game.tick % 600 === 0) this.difficultyLevel += 0.1;
+        
+        // 只有攒够了钱才行动 (波次逻辑)
+        // 假设AI想攒一个由 3个盾 + 2个弩 组成的编队 (~600块)
+        if (this.cooldown > 120 && game.enemyRes > 600) {
+            this.cooldown = 0;
+            this.spawnWave(game);
+        }
+    }
+
+    static spawnWave(game: Game) {
+        // 决策：攻击玩家最脆弱的一路，或者死守自己被攻击的一路
+        // 简单起见：随机选一路，但是重拳出击
+        const lane = Math.floor(Math.random()*3);
+        
+        // 瞬间生成一支部队 (Squad)
+        game.spawnUnit(Faction.ENEMY, UnitType.SHIELD, lane);
+        game.spawnUnit(Faction.ENEMY, UnitType.SHIELD, lane);
+        game.spawnUnit(Faction.ENEMY, UnitType.CROSSBOW, lane);
+        game.spawnUnit(Faction.ENEMY, UnitType.CROSSBOW, lane);
+        
+        // 如果很有钱，再加骑兵
+        if (game.enemyRes > 300) {
+            game.spawnUnit(Faction.ENEMY, UnitType.CAVALRY, lane);
+        }
+    }
+}
+
 // ==========================================
-// 4. 游戏主循环
+// 5. 游戏主控 (Main Game)
 // ==========================================
 class Game {
     static inst: Game;
     ctx: CanvasRenderingContext2D;
-    units: Unit[]=[]; wrecks: Wreckage[]=[];
-    res: number=800; score: number=0; shake: number=0; id: number=0;
     
+    units: Unit[]=[]; wrecks: Wreckage[]=[]; 
+    particles: Particle[]=[]; fx: any[]=[]; texts: any[]=[];
+    
+    playerRes: number = CONFIG.STARTING_RES;
+    enemyRes: number = CONFIG.STARTING_RES;
+    score: number = 0; shake: number = 0; tick: number = 0; id: number = 0;
+
     constructor() {
         Game.inst = this;
         const cvs = document.createElement('canvas');
         cvs.width=CONFIG.WIDTH; cvs.height=CONFIG.HEIGHT;
         document.body.appendChild(cvs);
         this.ctx = cvs.getContext('2d')!;
+        
         this.initMap();
         this.initUI();
         this.loop();
-        setInterval(()=>this.ai(), 2500);
     }
 
     initMap() {
-        // MOBA 塔分布：
-        // 基地附近三塔紧密 (高地塔)
-        // 河道附近塔 (一塔) 距离极远
-        const px = [100, 350]; // 塔X坐标
-        const ex = [CONFIG.WIDTH-100, CONFIG.WIDTH-350];
-        
-        [Lane.TOP, Lane.MID, Lane.BOT].forEach(l => {
+        const px = [80, 250]; // 塔位置更靠后
+        const ex = [CONFIG.WIDTH-80, CONFIG.WIDTH-250];
+        [0,1,2].forEach(l => {
             px.forEach(x => this.units.push(new Unit(this.id++, UnitType.TOWER, Faction.PLAYER, l, x)));
             ex.forEach(x => this.units.push(new Unit(this.id++, UnitType.TOWER, Faction.ENEMY, l, x)));
         });
     }
 
-    spawn(f: Faction, t: UnitType, l: Lane) {
+    spawnUnit(f: Faction, t: UnitType, l: Lane) {
+        const cost = UNIT_STATS[t].cost;
         if(f===Faction.PLAYER) {
-            if(this.res < UNIT_STATS[t].cost) return;
-            this.res -= UNIT_STATS[t].cost;
+            if(this.playerRes < cost) return;
+            this.playerRes -= cost;
+        } else {
+            this.enemyRes -= cost;
         }
+        
+        // 生成一队 (Squad Count)
         const count = UNIT_STATS[t].count;
-        const bx = f===Faction.PLAYER ? 50 : CONFIG.WIDTH-50;
+        const bx = f===Faction.PLAYER ? 30 : CONFIG.WIDTH-30;
         for(let i=0; i<count; i++) {
             this.units.push(new Unit(this.id++, t, f, l, bx+(Math.random()*40-20)));
         }
     }
     
-    addRes(f: Faction, v: number) { if(f===Faction.PLAYER) this.res+=v; }
-    spawnWreck(x: number, y: number, c: number) { this.wrecks.push(new Wreckage(x,y,c)); }
-
-    ai() {
-        const t = [UnitType.SHIELD, UnitType.CROSSBOW, UnitType.CAVALRY][Math.floor(Math.random()*3)];
-        const l = [Lane.TOP, Lane.MID, Lane.BOT][Math.floor(Math.random()*3)];
-        this.spawn(Faction.ENEMY, t, l);
-    }
-
-    getNetworkZones() {
-        // 计算连线
-        const towers = this.units.filter(u => u.type===UnitType.TOWER && !u.dead);
-        const zones = [];
-        for(let i=0; i<towers.length; i++) {
-            for(let j=i+1; j<towers.length; j++) {
-                const t1=towers[i]; const t2=towers[j];
-                if(t1.faction!==t2.faction) continue;
-                
-                const dist = Math.hypot(t1.x-t2.x, t1.y-t2.y);
-                // 核心 MOBA 逻辑：
-                // 只有距离小于阈值的塔才能形成连接。
-                // 中场因为兵线拉开了，塔距离 > LINK_MAX_DIST，所以如果不造中间建筑(未来扩展)，
-                // 这里的连接是断开的！
-                if(dist < CONFIG.LINK_MAX_DIST) {
-                    zones.push({faction:t1.faction, x1:t1.x, x2:t2.x, y1:t1.y, y2:t2.y});
-                }
-            }
-        }
-        return zones;
+    addRes(f: Faction, v: number) { 
+        if(f===Faction.PLAYER) this.playerRes+=v; 
+        else this.enemyRes+=v;
     }
 
     update() {
-        const zones = this.getNetworkZones();
-        Physics.update(this.units, this.wrecks);
-        this.units.forEach(u => u.update(1, this.units, this.wrecks, zones));
+        this.tick++;
+        
+        // 经济循环：非常慢的自然增长
+        if (this.tick % 10 === 0) {
+            this.playerRes += CONFIG.PASSIVE_INCOME;
+            this.enemyRes += CONFIG.PASSIVE_INCOME * EnemyAI.difficultyLevel; // AI作弊：随时间变强
+        }
+
+        EnemyAI.update(this);
+        Physics.resolve(this.units, this.wrecks);
+        
+        this.units.forEach(u => u.update(this.units, this.wrecks));
         this.units = this.units.filter(u => !u.dead);
+        
+        this.particles.forEach(p => p.update());
+        this.particles = this.particles.filter(p => p.life>0);
+        
         this.wrecks = this.wrecks.filter(w => !w.marked);
         
-        this.res += 0.5;
+        this.fx = this.fx.filter(f => { f.life--; return f.life>0; });
+        this.texts = this.texts.filter(t => { t.y-=0.5; t.life--; return t.life>0; });
+
         if(this.shake>0) this.shake*=0.9;
         
-        // 封锁胜利
-        let deep=0;
-        this.units.forEach(u=>{
+        // 胜利进度
+        let deep = 0;
+        this.units.forEach(u => {
             if(!u.static && u.faction===Faction.PLAYER && u.x>CONFIG.WIDTH*0.8) deep++;
             if(!u.static && u.faction===Faction.ENEMY && u.x<CONFIG.WIDTH*0.2) deep--;
         });
-        if(Math.abs(deep)>2) this.score += deep;
+        if(Math.abs(deep)>3) this.score += deep;
     }
 
     draw() {
         const ctx = this.ctx;
-        ctx.save();
-        if(this.shake>1) ctx.translate(Math.random()*this.shake, Math.random()*this.shake);
+        ctx.fillStyle='#111'; ctx.fillRect(0,0,CONFIG.WIDTH, CONFIG.HEIGHT);
         
-        ctx.fillStyle='#1e272e'; ctx.fillRect(0,0,CONFIG.WIDTH,CONFIG.HEIGHT);
+        ctx.save();
+        if(this.shake>1) ctx.translate(Math.random()*this.shake-this.shake/2, Math.random()*this.shake-this.shake/2);
 
-        // 绘制 MOBA 地图线
-        ctx.strokeStyle='rgba(255,255,255,0.05)'; ctx.lineWidth=40;
-        [Lane.TOP, Lane.MID, Lane.BOT].forEach(l => {
+        // 绘制兵线轨道
+        ctx.strokeStyle='rgba(255,255,255,0.05)'; ctx.lineWidth=30;
+        [0,1,2].forEach(l => {
             ctx.beginPath();
             for(let x=0; x<=CONFIG.WIDTH; x+=20) {
-                const y = MapGeometry.getLaneY(l, x);
+                const y = MapUtils.getLaneY(l, x);
                 if(x===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
             }
             ctx.stroke();
         });
 
-        // 绘制连线
-        const zones = this.getNetworkZones();
-        zones.forEach(z => {
-            ctx.strokeStyle = z.faction===Faction.PLAYER ? 'rgba(0,242,255,0.3)' : 'rgba(255,0,85,0.3)';
-            ctx.lineWidth=2; ctx.setLineDash([5,5]);
-            ctx.beginPath(); ctx.moveTo(z.x1,z.y1); ctx.lineTo(z.x2,z.y2); ctx.stroke();
-            ctx.setLineDash([]);
-        });
-
         this.wrecks.forEach(w => w.draw(ctx));
         this.units.forEach(u => u.draw(ctx));
+        this.particles.forEach(p => p.draw(ctx));
+        
+        // 攻击特效线
+        this.fx.forEach(f => {
+            ctx.strokeStyle = f.color; ctx.lineWidth=2; ctx.beginPath();
+            ctx.moveTo(f.x1, f.y1); ctx.lineTo(f.x2, f.y2); ctx.stroke();
+        });
+        
+        // 浮动文字
+        this.texts.forEach(t => {
+            ctx.fillStyle=t.color; ctx.font='12px monospace'; ctx.fillText(t.txt, t.x, t.y);
+        });
+
+        ctx.restore();
 
         // UI
-        ctx.restore();
-        ctx.fillStyle='#fff'; ctx.font='20px Arial'; ctx.fillText(`Points: ${Math.floor(this.res)}`, 20, 30);
+        this.drawUI();
+    }
+
+    drawUI() {
+        const ctx = this.ctx;
+        // 资源栏
+        ctx.fillStyle='#fff'; ctx.font='20px monospace'; ctx.textAlign='left';
+        ctx.fillText(`COMMAND POINTS: ${Math.floor(this.playerRes)}`, 20, 30);
         
+        // 胜利条
         const cx = CONFIG.WIDTH/2;
-        ctx.fillStyle='#333'; ctx.fillRect(cx-200,30,400,10);
-        const r = this.score/CONFIG.BLOCKADE_THRESHOLD;
-        ctx.fillStyle = r>0?'#0ff':'#f05'; ctx.fillRect(cx,30,r*200,10);
+        ctx.fillStyle='#333'; ctx.fillRect(cx-250, 20, 500, 15);
+        const r = this.score / CONFIG.BLOCKADE_THRESHOLD;
+        const w = Math.min(Math.abs(r), 1) * 250;
         
+        ctx.fillStyle = r>0 ? '#0ff' : '#f05';
+        if(r>0) ctx.fillRect(cx, 20, w, 15);
+        else ctx.fillRect(cx-w, 20, w, 15);
+        
+        // 中心刻度
+        ctx.fillStyle='#fff'; ctx.fillRect(cx-1, 15, 2, 25);
+
         if(Math.abs(r)>=1) {
-            ctx.fillStyle='rgba(0,0,0,0.8)'; ctx.fillRect(0,0,CONFIG.WIDTH,CONFIG.HEIGHT);
-            ctx.fillStyle='#fff'; ctx.font='60px Arial'; ctx.textAlign='center';
-            ctx.fillText(r>0?"VICTORY":"DEFEAT", cx, CONFIG.HEIGHT/2);
+            ctx.fillStyle='rgba(0,0,0,0.9)'; ctx.fillRect(0,0,CONFIG.WIDTH,CONFIG.HEIGHT);
+            ctx.fillStyle='#fff'; ctx.font='60px monospace'; ctx.textAlign='center';
+            ctx.fillText(r>0?"SECTOR SECURED":"CRITICAL FAILURE", cx, CONFIG.HEIGHT/2);
         }
     }
 
     initUI() {
-        const d = document.createElement('div');
-        d.style.cssText='position:fixed;bottom:10px;left:50%;transform:translateX(-50%);display:flex;gap:20px';
-        ['Top','Mid','Bot'].forEach((n,i) => {
-            const g=document.createElement('div'); g.style.textAlign='center';
-            g.innerHTML=`<div style="color:#888">${n}</div>`;
-            [UnitType.SHIELD, UnitType.CROSSBOW, UnitType.CAVALRY].forEach(t=>{
-                const b=document.createElement('button');
-                b.innerText=`${t} ${UNIT_STATS[t].cost}`;
-                b.onclick=()=>this.spawn(Faction.PLAYER,t,i as Lane);
-                b.style.cssText='display:block;margin:5px;background:#222;color:#eee;border:1px solid #555;padding:5px;cursor:pointer';
+        const box = document.createElement('div');
+        box.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);display:flex;gap:30px;';
+        ['TOP','MID','BOT'].forEach((n,i) => {
+            const g = document.createElement('div');
+            g.innerHTML = `<div style="color:#666;text-align:center;font-family:monospace;margin-bottom:5px">${n}</div>`;
+            [UnitType.SHIELD, UnitType.CROSSBOW, UnitType.CAVALRY].forEach(t => {
+                const b = document.createElement('button');
+                const s = UNIT_STATS[t];
+                b.innerHTML = `<span style="color:#eee">${s.label}</span> <span style="color:#888">$${s.cost}</span>`;
+                b.onclick = () => this.spawnUnit(Faction.PLAYER, t, i);
+                b.style.cssText = `
+                    display:block;width:120px;margin:5px;padding:8px;
+                    background:#1a1a1a;border:1px solid #333;color:#eee;
+                    cursor:pointer;font-family:monospace;text-align:left;font-size:12px;
+                    transition:0.2s;
+                `;
+                b.onmouseover = () => b.style.borderColor = '#0ff';
+                b.onmouseout = () => b.style.borderColor = '#333';
                 g.appendChild(b);
             });
-            d.appendChild(g);
+            box.appendChild(g);
         });
-        document.body.appendChild(d);
+        document.body.appendChild(box);
     }
 
     loop() {
-        this.update(); this.draw(); requestAnimationFrame(()=>this.loop());
+        this.update(); this.draw();
+        requestAnimationFrame(() => this.loop());
     }
 }
 
