@@ -456,12 +456,23 @@ class Game {
   }
 
   update(dt: number) {
-    // 物理引擎：碰撞分离 (Boids Separation)
+    // ==========================================
+    // 1. 物理引擎修复：智能碰撞 (Smart Collision)
+    // ==========================================
     for (let i=0; i<this.units.length; i++) {
         for (let j=i+1; j<this.units.length; j++) {
             const u1 = this.units[i]; const u2 = this.units[j];
-            if (u1.isDead || u2.isDead || (u1.isStatic && u2.isStatic)) continue;
+            if (u1.isDead || u2.isDead) continue;
             
+            // --- 修复开始：塔的穿透逻辑 ---
+            // 规则1: 如果是同一阵营，且其中一个是塔，则允许穿过 (不计算碰撞)
+            if (u1.faction === u2.faction) {
+                if (u1.type === UnitType.TOWER || u2.type === UnitType.TOWER) continue;
+            }
+            // 规则2: 塔和塔之间永远不计算碰撞 (防止初始化重叠导致的弹飞)
+            if (u1.isStatic && u2.isStatic) continue;
+            // --- 修复结束 ---
+
             const dx = u2.x - u1.x; const dy = u2.y - u1.y;
             const dist = Math.sqrt(dx*dx + dy*dy);
             const minDist = u1.radius + u2.radius + 2; // +2 缓冲空间
@@ -471,8 +482,9 @@ class Game {
                 const nx = dx / dist; const ny = dy / dist;
                 const totalM = u1.mass + u2.mass;
                 
+                // 施加推力
                 if (!u1.isStatic) {
-                    const f = overlap * (u2.mass / totalM);
+                    const f = overlap * (u2.mass / totalM); // 质量越大，推别人越狠
                     u1.x -= nx * f; u1.y -= ny * f;
                 }
                 if (!u2.isStatic) {
@@ -483,26 +495,29 @@ class Game {
         }
     }
 
-    // 漏斗地形约束
+    // ==========================================
+    // 2. 漏斗地形约束 (保持不变)
+    // ==========================================
     this.units.forEach(u => {
         if (u.isStatic) return;
         const centerX = CONFIG.WIDTH / 2;
-        const distRatio = Math.abs(u.x - centerX) / centerX; // 0=mid, 1=edge
-        const funnelWidth = (CONFIG.HEIGHT/CONFIG.LANE_COUNT/2 - 10) * (0.3 + 0.7 * (1 - distRatio)); // 中间宽，两头窄
+        const distRatio = Math.abs(u.x - centerX) / centerX;
+        const funnelWidth = (CONFIG.HEIGHT/CONFIG.LANE_COUNT/2 - 15) * (0.3 + 0.7 * (1 - distRatio));
         
         const laneIdx = Math.floor(u.y / (CONFIG.HEIGHT/3));
         const laneCy = laneIdx * (CONFIG.HEIGHT/3) + (CONFIG.HEIGHT/6);
         
-        // 软约束：推回车道
-        if (u.y > laneCy + funnelWidth) u.y -= 1;
-        if (u.y < laneCy - funnelWidth) u.y += 1;
+        // 软约束力度加强，防止穿模出界
+        if (u.y > laneCy + funnelWidth) u.y -= 2;
+        if (u.y < laneCy - funnelWidth) u.y += 2;
     });
 
-    // 实体更新
+    // ==========================================
+    // 3. 实体循环更新
+    // ==========================================
     this.units.forEach(u => u.update(dt, this.units, this.wreckages));
     this.units = this.units.filter(u => !u.isDead);
     
-    this.wreckages.forEach(w => {});
     this.wreckages = this.wreckages.filter(w => !w.markedForDeletion);
     
     this.particles.forEach(p => p.update());
@@ -511,6 +526,9 @@ class Game {
     this.floatingTexts.forEach(t => t.update());
     this.floatingTexts = this.floatingTexts.filter(t => t.life > 0);
 
+    // ==========================================
+    // 4. 全局逻辑
+    // ==========================================
     // 封锁分数计算
     let pDeep = 0; let eDeep = 0;
     this.units.forEach(u => {
@@ -521,7 +539,8 @@ class Game {
     });
     if(pDeep > 5) this.blockadeScore += 5;
     if(eDeep > 5) this.blockadeScore -= 5;
-    if(pDeep <= 2 && this.blockadeScore > 0) this.blockadeScore -= 2; // 缓慢衰减
+    if(pDeep <= 2 && this.blockadeScore > 0) this.blockadeScore -= 2;
+    if(eDeep <= 2 && this.blockadeScore < 0) this.blockadeScore += 2; // 修复了分数值回滚方向
     
     // 资源自然恢复
     this.playerRes += 0.5; 
@@ -530,7 +549,7 @@ class Game {
     if (this.shake > 0) this.shake *= 0.9;
     if (this.shake < 0.5) this.shake = 0;
   }
-
+  
   draw() {
     const ctx = this.ctx;
     
